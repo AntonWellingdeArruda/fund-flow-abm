@@ -1,0 +1,116 @@
+"""Real Brazilian fund flows from CVM's open-data portal (free, no auth).
+
+Informe Diário — per-fund, per-day inflows/outflows/NAV:
+  https://dados.cvm.gov.br/dados/FI/DOC/INF_DIARIO/DADOS/inf_diario_fi_YYYYMM.zip
+  cols: CNPJ_FUNDO_CLASSE, DT_COMPTC, CAPTC_DIA, RESG_DIA, VL_PATRIM_LIQ, ...
+        (older files use CNPJ_FUNDO / TP_FUNDO)
+
+Cadastro — fund registry (used by the CVM-native category fallback):
+  https://dados.cvm.gov.br/dados/FI/CAD/DADOS/cad_fi.csv
+  cols: CNPJ_FUNDO, DENOM_SOCIAL, CLASSE, ...
+
+CSVs are ';'-separated, decimal ',', latin-1. The portal 403s requests without
+a browser User-Agent. HTTP and parsing are split so parsing is testable offline.
+NOTE: CVM blocks some datacenter IPs — run live fetches from an allowed network.
+"""
+from __future__ import annotations
+
+import io
+import re
+import urllib.error
+import urllib.request
+import zipfile
+
+import pandas as pd
+
+INFORME_URL = (
+    "https://dados.cvm.gov.br/dados/FI/DOC/INF_DIARIO/DADOS/inf_diario_fi_{ym}.zip"
+)
+CADASTRO_URL = "https://dados.cvm.gov.br/dados/FI/CAD/DADOS/cad_fi.csv"
+
+_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124 Safari/537.36"
+
+# Canonical column aliases (informe schema changed with RCVM 175).
+_CNPJ_ALIASES = ("CNPJ_FUNDO_CLASSE", "CNPJ_FUNDO")
+_INFORME_RENAME = {
+    "DT_COMPTC": "date",
+    "CAPTC_DIA": "captacao",
+    "RESG_DIA": "resgate",
+    "VL_PATRIM_LIQ": "pl",
+}
+
+
+class CvmFetchError(RuntimeError):
+    """Raised when a CVM download fails (network, HTTP, or bad archive)."""
+
+
+def normalize_cnpj(value: str) -> str:
+    """Strip CNPJ formatting → 14 digit string ('00.000.000/0001-00' → digits)."""
+    return re.sub(r"\D", "", str(value))
+
+
+def _http_get_bytes(url: str, timeout: float) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": _UA})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read()
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise CvmFetchError(f"CVM request failed: {url}\n{exc}") from exc
+
+
+def _parse_informe_csv(text: str) -> pd.DataFrame:
+    """Parse one informe-diário CSV into [cnpj, date, captacao, resgate, pl]."""
+    # All columns as str to preserve CNPJ leading zeros; numerics use decimal
+    # comma, so convert ',' → '.' before to_numeric.
+    df = pd.read_csv(io.StringIO(text), sep=";", dtype=str)
+    cnpj_col = next((c for c in _CNPJ_ALIASES if c in df.columns), None)
+    if cnpj_col is None:
+        raise CvmFetchError(f"informe CSV missing CNPJ column; has {list(df.columns)[:6]}")
+
+    out = pd.DataFrame({"cnpj": df[cnpj_col].map(normalize_cnpj)})
+    out["date"] = df["DT_COMPTC"]
+    for src, dst in (("CAPTC_DIA", "captacao"), ("RESG_DIA", "resgate"),
+                     ("VL_PATRIM_LIQ", "pl")):
+        out[dst] = pd.to_numeric(
+            df[src].str.replace(",", ".", regex=False), errors="coerce"
+        )
+    return out.dropna(subset=["captacao", "resgate"])
+
+
+def fetch_informe_diario(year_month: str, timeout: float = 60.0) -> pd.DataFrame:
+    """Download + parse one month's informe diário (year_month = 'YYYYMM').
+
+    Reads every CSV member in the zip (RCVM 175 may split by class) and concats.
+    """
+    raw = _http_get_bytes(INFORME_URL.format(ym=year_month), timeout)
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(raw))
+    except zipfile.BadZipFile as exc:
+        raise CvmFetchError(f"CVM returned a non-zip payload for {year_month}") from exc
+
+    frames = [
+        _parse_informe_csv(zf.read(name).decode("latin-1"))
+        for name in zf.namelist() if name.lower().endswith(".csv")
+    ]
+    if not frames:
+        raise CvmFetchError(f"no CSV members in informe zip for {year_month}")
+    return pd.concat(frames, ignore_index=True)
+
+
+def _parse_cadastro_csv(text: str) -> pd.DataFrame:
+    """Parse cad_fi.csv into [cnpj, classe]."""
+    df = pd.read_csv(io.StringIO(text), sep=";", dtype=str, encoding=None)
+    cnpj_col = next((c for c in _CNPJ_ALIASES if c in df.columns), None)
+    classe_col = "CLASSE" if "CLASSE" in df.columns else None
+    if cnpj_col is None or classe_col is None:
+        raise CvmFetchError(f"cadastro missing CNPJ/CLASSE; has {list(df.columns)[:8]}")
+    return pd.DataFrame({
+        "cnpj": df[cnpj_col].map(normalize_cnpj),
+        "classe": df[classe_col],
+    }).dropna(subset=["classe"])
+
+
+def fetch_cadastro(timeout: float = 60.0) -> pd.DataFrame:
+    """Download + parse the CVM fund registry (cad_fi.csv) → [cnpj, classe]."""
+    raw = _http_get_bytes(CADASTRO_URL, timeout)
+    return _parse_cadastro_csv(raw.decode("latin-1"))

@@ -130,6 +130,54 @@ class AnbimaFlowSource:
         )
 
 
+class CvmFlowSource:
+    """Real fund flows from CVM Informe Diário, aggregated to Anbima categories.
+
+    For each month in [start, end], downloads the informe, maps each fund's CNPJ
+    to an Anbima category via `mapper`, and sums to monthly per-category flows:
+        net_flow_brl         = Σ(CAPTC_DIA − RESG_DIA)
+        redemption_gross_brl = Σ(RESG_DIA)
+    (gross subscriptions are recoverable as net + redemption_gross.)
+
+    `scale` divides BRL values (e.g. 1e9 → R$ billions). Funds whose CNPJ is not
+    in the mapper are dropped. CVM may 403 datacenter IPs — run from an allowed
+    network.
+    """
+
+    def __init__(self, start: str, end: str, mapper, scale: float = 1.0,
+                 timeout: float = 60.0):
+        self.start = start
+        self.end = end
+        self.mapper = mapper
+        self.scale = scale
+        self.timeout = timeout
+
+    def load(self) -> pd.DataFrame:
+        from fund_flow.data.cvm import fetch_informe_diario
+
+        cnpj_to_cat = self.mapper.mapping()
+        months = pd.period_range(self.start, self.end, freq="M")
+        rows = []
+        for m in months:
+            ym = f"{m.year}{m.month:02d}"
+            informe = fetch_informe_diario(ym, self.timeout)
+            informe = informe.copy()
+            informe["category"] = informe["cnpj"].map(cnpj_to_cat)
+            informe = informe.dropna(subset=["category"])
+            grp = informe.groupby("category").agg(
+                captacao=("captacao", "sum"),
+                resgate=("resgate", "sum"),
+            )
+            for category, r in grp.iterrows():
+                rows.append({
+                    "period": str(m),
+                    "category": category,
+                    "net_flow_brl": (r["captacao"] - r["resgate"]) / self.scale,
+                    "redemption_gross_brl": r["resgate"] / self.scale,
+                })
+        return pd.DataFrame(rows, columns=FLOW_COLUMNS)
+
+
 class FredMacroSource:
     """Real US macro from FRED (needs a free API key in FRED_API_KEY).
 
