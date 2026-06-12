@@ -1,0 +1,37 @@
+seed: 42
+
+categories:
+  - "Ações"
+  - "Multimercado"
+  - "Renda Fixa"
+  - "Crédito Privado"
+  - "Previdência"
+  - "Cambial"
+
+# come-cotas: semiannual (May + Nov) tax withholding on open-ended funds.
+# Exempt per current law (incl. Lei 14.754/2023): Ações, Previdência.
+# Subject: Renda Fixa, Multimercado, Crédito Privado, Cambial.
+come_cotas_exempt:
+  - "Ações"
+  - "Previdência"
+
+synthetic:
+  predictor:
+    n_months: 120            # ~10 years of monthly data
+    start_date: "2014-01"
+    selic_high_mean: 0.1275  # p.a. high regime
+    selic_low_mean: 0.0550   # p.a. low regime
+    ar1_flow_coeff: 0.45     # within-category flow autocorrelation
+    ibov_to_acoes_lag_beta: 0.30   # lagged Ibovespa return → next-period Ações flow
+    selic_to_rf_lag_beta: 0.25     # lagged Δselic → next-period Renda Fixa flow
+
+  abm:
+    n_funds: 12
+    n_instruments: 60
+    instrument_mix:           # fraction of instrument count per type
+      debenture: 0.60
+      CRI_CRA: 0.25
+      FIDC_quota: 0.15
+    min_overlap: 3            # minimum funds holding any single instrument
+    liquid_buffer_pct: 0.05   # fraction of NAV in LFT/cash (non-contagious)
+    d_plus_windows: [0, 1, 5, 30]
