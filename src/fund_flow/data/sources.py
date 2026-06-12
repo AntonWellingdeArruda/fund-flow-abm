@@ -91,19 +91,114 @@ class CsvMacroSource:
 # --- Real public-source stubs (documented seams; no network calls in Phase 1) ---
 
 class AnbimaFlowSource:
-    """Public Anbima captação líquida by category.
+    """ANBIMA captação líquida by category via the authenticated API.
 
-    Endpoint: Anbima publishes monthly consolidated industry statistics
-    (Consolidado Histórico de Fundos) as downloadable spreadsheets. Implement
-    `load()` to fetch + reshape to FLOW_COLUMNS once the environment is
-    approved for that data class (CLAUDE.md §5).
+    OAuth2 is fully wired (see fund_flow.data.anbima.AnbimaClient). The DATA
+    endpoint path for captação líquida depends on the subscribed API product
+    and must be supplied via `data_path`; once known, load() fetches and
+    reshapes it to FLOW_COLUMNS.
     """
 
-    def load(self) -> pd.DataFrame:  # pragma: no cover - intentional stub
-        raise NotImplementedError(
-            "AnbimaFlowSource is a documented seam. Use SyntheticFlowSource or "
-            "CsvFlowSource until a public/approved Anbima feed is wired in."
+    def __init__(self, data_path: str | None = None, client=None):
+        self._data_path = data_path
+        self._client = client
+
+    def _make_client(self):
+        from fund_flow.config import get_secret
+        from fund_flow.data.anbima import AnbimaClient
+        return AnbimaClient(
+            get_secret("ANBIMA_CLIENT_ID"),
+            get_secret("ANBIMA_CLIENT_SECRET"),
         )
+
+    def load(self) -> pd.DataFrame:
+        if self._data_path is None:
+            raise NotImplementedError(
+                "ANBIMA OAuth is wired, but the captação-líquida data endpoint "
+                "is unknown. Provide AnbimaFlowSource(data_path=...) once the "
+                "API product / path is confirmed; then map the response to "
+                f"{FLOW_COLUMNS}."
+            )
+        client = self._client or self._make_client()
+        raw = client.get(self._data_path)
+        # Reshaping to FLOW_COLUMNS is endpoint-specific; implement once the
+        # response schema is known.
+        raise NotImplementedError(
+            f"Fetched ANBIMA payload from {self._data_path!r}; add reshape to "
+            f"{FLOW_COLUMNS} for this endpoint's schema. Sample keys: "
+            f"{list(raw)[:8] if isinstance(raw, dict) else type(raw).__name__}"
+        )
+
+
+class FredMacroSource:
+    """Real US macro from FRED (needs a free API key in FRED_API_KEY).
+
+    Returns: period, ust_10y, fed_funds, sp500_return, usd_broad_return.
+    """
+
+    def __init__(self, start: str = "2010-01", end: str | None = None,
+                 api_key: str | None = None, timeout: float = 30.0):
+        self.start = start
+        self.end = end
+        self.api_key = api_key
+        self.timeout = timeout
+
+    def load(self) -> pd.DataFrame:
+        from fund_flow.config import get_secret
+        from fund_flow.data.bcb import to_monthly_last
+        from fund_flow.data.fred import (
+            FED_FUNDS,
+            SP500,
+            UST_10Y,
+            USD_BROAD,
+            fetch_fred,
+        )
+
+        key = self.api_key or get_secret("FRED_API_KEY")
+        start_iso = pd.Period(self.start, freq="M").start_time.date().isoformat()
+        end_iso = (
+            pd.Period(self.end, freq="M").end_time.date().isoformat()
+            if self.end else None
+        )
+
+        def fetch(sid):
+            return to_monthly_last(fetch_fred(sid, key, start_iso, end_iso, self.timeout))
+
+        ust = fetch(UST_10Y) / 100.0          # % → fraction
+        ff = fetch(FED_FUNDS) / 100.0
+        sp = fetch(SP500)
+        usd = fetch(USD_BROAD)
+
+        df = pd.DataFrame({
+            "ust_10y": ust,
+            "fed_funds": ff,
+            "sp500_return": sp.pct_change(),
+            "usd_broad_return": usd.pct_change(),
+        }).dropna()
+        df.index = df.index.astype(str)
+        return df.reset_index(names="period")
+
+
+class CompositeMacroSource:
+    """Merge several MacroSources on `period` into one real macro table.
+
+    e.g. CompositeMacroSource([BcbMacroSource(...), FredMacroSource(...)])
+    yields the combined Brazil + US macro frame. The pipeline is
+    macro-column-agnostic, so any merged column set flows through.
+    """
+
+    def __init__(self, sources: list[MacroSource], how: str = "inner"):
+        if not sources:
+            raise ValueError("CompositeMacroSource needs at least one source")
+        self._sources = sources
+        self._how = how
+
+    def load(self) -> pd.DataFrame:
+        merged: pd.DataFrame | None = None
+        for src in self._sources:
+            df = src.load()
+            merged = df if merged is None else merged.merge(df, on="period", how=self._how)
+        return merged.sort_values("period").reset_index(drop=True)
 
 
 class BcbMacroSource:
