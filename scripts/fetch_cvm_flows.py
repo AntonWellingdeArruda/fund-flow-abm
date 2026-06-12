@@ -2,15 +2,18 @@
 """Fetch REAL fund flows from CVM Informe Diário, categorized to Anbima classes.
 
 Usage (run from a network CVM allows — it 403s some datacenter IPs):
-    PYTHONPATH=src python scripts/fetch_cvm_flows.py --start 2024-01 --end 2024-06
-        [--mapper anbima|cvm]   # default: anbima, falling back to cvm
-        [--scale 1e9]           # R$ billions
+    PYTHONPATH=src python3 scripts/fetch_cvm_flows.py --start 2024-01 --end 2024-06
+        [--mapper registro|anbima|cvm]   # default: registro
+        [--scale 1e9]                    # R$ billions
         [--out flows_real.csv]
 
---mapper anbima : official ANBIMA taxonomy via Fundos v2 (needs production API
-                  access; falls back to CVM cadastro on AnbimaError).
---mapper cvm    : CVM cad_fi.csv CLASSE only (no auth; coarser — no Crédito
-                  Privado / Previdência split).
+--mapper registro : CVM RCVM-175 class registry (free, no auth). Full ANBIMA
+                    taxonomy incl. Crédito Privado + Previdência; joins the
+                    informe at share-class level → ~94% AUM coverage. BEST.
+--mapper anbima   : official ANBIMA Fundos v2 API (needs production access;
+                    falls back to CVM cadastro on AnbimaError).
+--mapper cvm      : CVM cad_fi.csv CLASSE only (coarse; no Crédito Privado /
+                    Previdência split, and only ~2.5% AUM under RCVM 175).
 """
 from __future__ import annotations
 
@@ -19,6 +22,7 @@ import argparse
 from fund_flow.data.categories import (
     AnbimaCategoryMapper,
     CvmCadastroCategoryMapper,
+    CvmRegistroClasseCategoryMapper,
 )
 from fund_flow.data.cvm import fetch_cadastro
 from fund_flow.data.sources import CvmFlowSource
@@ -29,7 +33,14 @@ def _cvm_mapper():
     return CvmCadastroCategoryMapper(fetch_cadastro())
 
 
+def _registro_mapper():
+    print("Building category map from CVM RCVM-175 class registry …")
+    return CvmRegistroClasseCategoryMapper()
+
+
 def build_mapper(kind: str):
+    if kind == "registro":
+        return _registro_mapper()
     if kind == "cvm":
         return _cvm_mapper()
     # anbima (with graceful fallback)
@@ -56,7 +67,9 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--start", required=True)   # YYYY-MM
     ap.add_argument("--end", required=True)
-    ap.add_argument("--mapper", choices=["anbima", "cvm"], default="anbima")
+    ap.add_argument(
+        "--mapper", choices=["registro", "anbima", "cvm"], default="registro"
+    )
     ap.add_argument("--scale", type=float, default=1e9)
     ap.add_argument("--out", default=None)
     args = ap.parse_args()

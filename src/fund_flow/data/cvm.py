@@ -27,6 +27,10 @@ INFORME_URL = (
     "https://dados.cvm.gov.br/dados/FI/DOC/INF_DIARIO/DADOS/inf_diario_fi_{ym}.zip"
 )
 CADASTRO_URL = "https://dados.cvm.gov.br/dados/FI/CAD/DADOS/cad_fi.csv"
+# RCVM 175 class-level registry. registro_classe.csv keys on CNPJ_Classe (which
+# matches the informe's CNPJ_FUNDO_CLASSE) and carries the full ANBIMA taxonomy
+# in Classificacao_Anbima — the same data the blocked ANBIMA Fundos API serves.
+REGISTRO_URL = "https://dados.cvm.gov.br/dados/FI/CAD/DADOS/registro_fundo_classe.zip"
 
 _UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124 Safari/537.36"
 
@@ -114,3 +118,37 @@ def fetch_cadastro(timeout: float = 60.0) -> pd.DataFrame:
     """Download + parse the CVM fund registry (cad_fi.csv) → [cnpj, classe]."""
     raw = _http_get_bytes(CADASTRO_URL, timeout)
     return _parse_cadastro_csv(raw.decode("latin-1"))
+
+
+def _parse_registro_classe_csv(text: str) -> pd.DataFrame:
+    """Parse registro_classe.csv into [cnpj, anbima, classificacao, situacao]."""
+    df = pd.read_csv(io.StringIO(text), sep=";", dtype=str)
+    if "CNPJ_Classe" not in df.columns:
+        raise CvmFetchError(
+            f"registro_classe missing CNPJ_Classe; has {list(df.columns)[:8]}"
+        )
+    return pd.DataFrame({
+        "cnpj": df["CNPJ_Classe"].map(normalize_cnpj),
+        "anbima": df.get("Classificacao_Anbima"),
+        "classificacao": df.get("Classificacao"),
+        "situacao": df.get("Situacao"),
+    })
+
+
+def fetch_registro_classe(timeout: float = 120.0) -> pd.DataFrame:
+    """Download + parse the RCVM 175 class registry → [cnpj, anbima, ...].
+
+    `cnpj` is the share-class CNPJ (CNPJ_Classe), which joins directly to the
+    informe diário's CNPJ_FUNDO_CLASSE. `anbima` is the ANBIMA classification.
+    """
+    raw = _http_get_bytes(REGISTRO_URL, timeout)
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(raw))
+    except zipfile.BadZipFile as exc:
+        raise CvmFetchError("CVM returned a non-zip payload for registro") from exc
+    member = next(
+        (n for n in zf.namelist() if n.lower() == "registro_classe.csv"), None
+    )
+    if member is None:
+        raise CvmFetchError(f"registro_classe.csv not in zip; has {zf.namelist()}")
+    return _parse_registro_classe_csv(zf.read(member).decode("latin-1"))
