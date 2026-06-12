@@ -24,6 +24,10 @@ synthetic:
     ar1_flow_coeff: 0.45     # within-category flow autocorrelation
     ibov_to_acoes_lag_beta: 0.30   # lagged Ibovespa return → next-period Ações flow
     selic_to_rf_lag_beta: 0.25     # lagged Δselic → next-period Renda Fixa flow
+    cross_category_coupling: 0.35  # lagged risk-off rotation between paired categories
+                                   # (money leaving equities → fixed income next month);
+                                   # this is the cross-category structure §3.3 requires
+                                   # and that a univariate AR(1) cannot capture.
 
   abm:
     n_funds: 12

@@ -10,6 +10,8 @@ dependencies = [
     "pandas>=2.2",
     "numpy>=1.26",
     "pyyaml>=6.0",
+    "statsmodels>=0.14",
+    "scipy>=1.11",
 ]
 
 [project.optional-dependencies]
@@ -20,3 +22,6 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Resolve the package from src/ directly — robust against editable-install
+# .pth quirks when the project path contains spaces.
+pythonpath = ["src"]

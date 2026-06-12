@@ -56,6 +56,17 @@ _MACRO_BETAS: dict[str, tuple[str, float]] = {
     "Renda Fixa": ("delta_selic", 0.0),      # overridden by selic_to_rf_lag_beta
 }
 
+# Lagged risk-off rotation: last month's flow into one category pulls flow OUT of
+# its paired category this month (and vice versa). This is genuine cross-category
+# lag structure (CLAUDE.md §3.3) that a univariate AR(1) cannot represent — only a
+# joint VAR can. Pairs are risk-on ↔ risk-off counterparts.
+_ROTATION_PARTNER: dict[str, str] = {
+    "Ações": "Renda Fixa",
+    "Renda Fixa": "Ações",
+    "Multimercado": "Crédito Privado",
+    "Crédito Privado": "Multimercado",
+}
+
 
 def generate_predictor_panel(cfg: dict) -> pd.DataFrame:
     """Return long-format DataFrame with one row per (period, category).
@@ -73,6 +84,7 @@ def generate_predictor_panel(cfg: dict) -> pd.DataFrame:
     ar1: float = pc["ar1_flow_coeff"]
     ibov_beta: float = pc["ibov_to_acoes_lag_beta"]
     selic_rf_beta: float = pc["selic_to_rf_lag_beta"]
+    coupling: float = pc.get("cross_category_coupling", 0.0)
 
     periods = pd.period_range(start=pc["start_date"], periods=n_months, freq="M")
 
@@ -118,8 +130,16 @@ def generate_predictor_panel(cfg: dict) -> pd.DataFrame:
                 macro_signal = selic_rf_beta * delta_selic[lag_t]
 
             ar_term = ar1 * flow_net[cat][t - 1] if t > 0 else 0.0
+
+            # Lagged risk-off rotation: inflow to the partner last month draws
+            # flow out of this category this month (cross-category VAR structure).
+            rotation = 0.0
+            partner = _ROTATION_PARTNER.get(cat)
+            if partner is not None and t > 0:
+                rotation = -coupling * flow_net[partner][t - 1]
+
             noise = flow_rng.normal(0, _NOISE_STD[cat])
-            flow_net[cat][t] = regime_mean + ar_term + macro_signal + noise
+            flow_net[cat][t] = regime_mean + ar_term + macro_signal + rotation + noise
 
             # Gross redemptions: always positive; modelled as a fraction of NAV proxy
             # Inflow months have small mechanical redemptions; outflow months larger.
