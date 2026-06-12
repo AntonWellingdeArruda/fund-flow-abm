@@ -179,6 +179,33 @@ class FredMacroSource:
         return df.reset_index(names="period")
 
 
+class IbovespaSource:
+    """Real Ibovespa monthly return via yfinance (^BVSP). Returns:
+        period, ibovespa_return
+
+    Isolated behind the MacroSource seam — if Yahoo's unofficial endpoint
+    breaks, drop this source from the composite and the rest still works.
+    """
+
+    def __init__(self, start: str = "2010-01", end: str | None = None):
+        self.start = start
+        self.end = end
+
+    def load(self) -> pd.DataFrame:
+        from fund_flow.data.bcb import to_monthly_last
+        from fund_flow.data.yahoo import IBOVESPA, fetch_yahoo_close
+
+        start_iso = pd.Period(self.start, freq="M").start_time.date().isoformat()
+        end_iso = (
+            pd.Period(self.end, freq="M").end_time.date().isoformat()
+            if self.end else None
+        )
+        close = to_monthly_last(fetch_yahoo_close(IBOVESPA, start_iso, end_iso))
+        df = pd.DataFrame({"ibovespa_return": close.pct_change()}).dropna()
+        df.index = df.index.astype(str)
+        return df.reset_index(names="period")
+
+
 class CompositeMacroSource:
     """Merge several MacroSources on `period` into one real macro table.
 
