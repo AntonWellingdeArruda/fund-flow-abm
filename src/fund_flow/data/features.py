@@ -19,15 +19,12 @@ from fund_flow.utils.calendar import is_come_cotas
 
 TARGET_COLUMNS = ["net_flow_brl", "redemption_gross_brl"]
 
-# Raw columns that get lagged into predictors; their contemporaneous values are dropped.
-_MACRO_LAG_SOURCES = [
-    "selic_rate", "delta_selic", "ipca_monthly",
-    "ibovespa_return", "dxy_return", "ust_10y", "regime",
-]
+# Own-flow columns lagged into AR predictors (and kept contemporaneous as targets).
 _FLOW_LAG_SOURCES = ["net_flow_brl", "redemption_gross_brl"]
 
-# Kept as metadata (NOT predictors).
-_METADATA = ["period", "category", "regime"]
+# Latent-state label: lagged into a feature, kept contemporaneous as metadata
+# (the regime-switching model infers it; it is never a contemporaneous predictor).
+_REGIME = "regime"
 
 
 def build_model_frame(
@@ -44,10 +41,15 @@ def build_model_frame(
     if n_lags < 1:
         raise ValueError("n_lags must be >= 1")
 
+    # Macro lag sources are discovered from whatever the macro table provides
+    # (synthetic supplies the full set; a real adapter may supply a subset),
+    # so the pipeline is not tied to the synthetic column list.
+    macro_sources = [c for c in macro.columns if c != "period"]
+    lag_sources = _FLOW_LAG_SOURCES + macro_sources
+
     merged = flows.merge(macro, on="period", how="inner")
     merged = merged.sort_values(["category", "period"]).reset_index(drop=True)
 
-    lag_sources = _FLOW_LAG_SOURCES + _MACRO_LAG_SOURCES
     grouped = merged.groupby("category", sort=False)
     for col in lag_sources:
         for k in range(1, n_lags + 1):
@@ -63,10 +65,9 @@ def build_model_frame(
     deepest = [f"{col}_lag{n_lags}" for col in lag_sources]
     merged = merged.dropna(subset=deepest).reset_index(drop=True)
 
-    # Structurally drop contemporaneous macro/return predictors (keep regime label).
-    drop_contemporaneous = [
-        c for c in _MACRO_LAG_SOURCES if c != "regime"
-    ]
+    # Structurally drop contemporaneous macro/return predictors (keep regime
+    # label as metadata if present) to prevent look-ahead leakage (§3.2).
+    drop_contemporaneous = [c for c in macro_sources if c != _REGIME]
     merged = merged.drop(columns=drop_contemporaneous)
 
     return merged

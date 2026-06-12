@@ -5,7 +5,6 @@ from fund_flow.data.sources import (
     FLOW_COLUMNS,
     MACRO_COLUMNS,
     AnbimaFlowSource,
-    BcbMacroSource,
     CsvFlowSource,
     CsvMacroSource,
     SyntheticFlowSource,
@@ -51,9 +50,6 @@ class TestCsvSources:
 
 class TestRealSourceStubs:
     def test_anbima_stub_raises(self):
+        # Anbima flows are still a documented seam (spreadsheet scraping TBD).
         with pytest.raises(NotImplementedError):
             AnbimaFlowSource().load()
-
-    def test_bcb_stub_raises(self):
-        with pytest.raises(NotImplementedError):
-            BcbMacroSource().load()

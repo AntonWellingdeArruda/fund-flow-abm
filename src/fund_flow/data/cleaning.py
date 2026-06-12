@@ -55,12 +55,18 @@ def clean_flows(df: pd.DataFrame) -> pd.DataFrame:
 def clean_macro(df: pd.DataFrame) -> pd.DataFrame:
     """Validate, sort, dedup, and forward-fill the raw macro table.
 
-    Missing macro observations are forward-filled (last realized value carries
-    forward), which is the honest treatment for a slow-moving monthly series;
-    any remaining leading NaN is back-filled so the first period is usable.
+    Accepts any macro column set (synthetic supplies the full schema; a real
+    adapter may supply a subset) provided it has 'period' plus ≥1 indicator.
+    'regime' is optional (synthetic-only latent label). Missing observations
+    are forward-filled (honest for a slow-moving monthly series); leading NaN
+    is back-filled so the first period is usable.
     """
-    _require_columns(df, MACRO_COLUMNS, "macro")
-    df = df[MACRO_COLUMNS].copy()
+    _require_columns(df, ["period"], "macro")
+    df = df.copy()
+
+    indicator_cols = [c for c in df.columns if c != "period"]
+    if not indicator_cols:
+        raise ValueError("macro must have at least one indicator column")
 
     _validate_periods(df["period"], "macro")
 
@@ -70,12 +76,13 @@ def clean_macro(df: pd.DataFrame) -> pd.DataFrame:
     if df["period"].duplicated().any():
         raise ValueError("macro has duplicate periods after dedup")
 
-    numeric_cols = [c for c in MACRO_COLUMNS if c not in ("period", "regime")]
+    numeric_cols = [c for c in indicator_cols if c != "regime"]
     for c in numeric_cols:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df[numeric_cols] = df[numeric_cols].ffill().bfill()
 
-    df["regime"] = df["regime"].astype(int)
+    if "regime" in df.columns:
+        df["regime"] = df["regime"].astype(int)
 
     if df[numeric_cols].isnull().any().any():
         raise ValueError("macro still has NaN after fill")

@@ -9,11 +9,24 @@ from __future__ import annotations
 
 import pandas as pd
 
-# Lagged macro columns used as exogenous regressors (all already _lag1).
-EXOG_COLUMNS = [
-    "selic_rate_lag1", "delta_selic_lag1", "ipca_monthly_lag1",
-    "ibovespa_return_lag1", "dxy_return_lag1", "ust_10y_lag1",
-]
+# Lag columns that are NOT exogenous macro regressors: own-flow AR lags and the
+# latent regime label (kept out of exog because regime is unobserved in production).
+_NON_EXOG_LAGS = frozenset({
+    "net_flow_brl_lag1", "redemption_gross_brl_lag1", "regime_lag1",
+})
+
+
+def exog_columns(frame: pd.DataFrame) -> list[str]:
+    """Discover lagged-macro exogenous regressors present in the frame.
+
+    Generic across data sources: any '*_lag1' column that is not an own-flow
+    AR lag or the regime label. Synthetic supplies the full macro set; a real
+    adapter (e.g. BCB) may supply a subset — both work unchanged.
+    """
+    return [
+        c for c in frame.columns
+        if c.endswith("_lag1") and c not in _NON_EXOG_LAGS
+    ]
 
 
 def wide_flows(frame: pd.DataFrame, value: str = "net_flow_brl") -> pd.DataFrame:
@@ -34,7 +47,7 @@ def wide_exog(frame: pd.DataFrame, columns: list[str] | None = None) -> pd.DataF
     Macro is identical across categories within a period, so we take the
     first row per period. Index aligns with wide_flows().
     """
-    cols = columns or EXOG_COLUMNS
+    cols = columns or exog_columns(frame)
     macro = (
         frame[["period", *cols]]
         .drop_duplicates(subset="period")
