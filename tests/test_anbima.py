@@ -45,6 +45,7 @@ def anbima_creds():
     return get_secret("ANBIMA_CLIENT_ID"), get_secret("ANBIMA_CLIENT_SECRET")
 
 
+@pytest.mark.live
 class TestLiveOAuth:
     def test_real_token_exchange(self, anbima_creds):
         cid, secret = anbima_creds

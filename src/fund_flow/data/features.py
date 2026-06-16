@@ -32,11 +32,19 @@ def build_model_frame(
     macro: pd.DataFrame,
     exempt: list[str],
     n_lags: int = 1,
+    extra_lag_sources: list[str] | None = None,
 ) -> pd.DataFrame:
     """Merge cleaned flows + macro into a tidy, lag-disciplined modeling frame.
 
     One row per (period, category). Drops the first n_lags periods per category
-    (no lag available). Returns no NaN.
+    (no lag available). Returns no NaN in the REQUIRED predictors.
+
+    extra_lag_sources: PER-CATEGORY columns already present in `flows` (Phase 2.6
+    excess returns). They are lagged per category and their contemporaneous form
+    is dropped, exactly like macro — BUT they are *optional*: they may be NaN
+    (Cambial, early periods, pre-2018 IMA-B funds) and are deliberately excluded
+    from the warm-up dropna, so a sparse excess signal never deletes the flow rows
+    the base models need.
     """
     if n_lags < 1:
         raise ValueError("n_lags must be >= 1")
@@ -45,13 +53,15 @@ def build_model_frame(
     # (synthetic supplies the full set; a real adapter may supply a subset),
     # so the pipeline is not tied to the synthetic column list.
     macro_sources = [c for c in macro.columns if c != "period"]
-    lag_sources = _FLOW_LAG_SOURCES + macro_sources
+    extra = [c for c in (extra_lag_sources or []) if c in flows.columns]
+    required_lag = _FLOW_LAG_SOURCES + macro_sources
+    all_lag = required_lag + extra
 
     merged = flows.merge(macro, on="period", how="inner")
     merged = merged.sort_values(["category", "period"]).reset_index(drop=True)
 
     grouped = merged.groupby("category", sort=False)
-    for col in lag_sources:
+    for col in all_lag:
         for k in range(1, n_lags + 1):
             merged[f"{col}_lag{k}"] = grouped[col].shift(k)
 
@@ -61,13 +71,14 @@ def build_model_frame(
         for p, c in zip(merged["period"], merged["category"])
     ]
 
-    # Drop warmup rows that lack the deepest lag.
-    deepest = [f"{col}_lag{n_lags}" for col in lag_sources]
+    # Drop warm-up rows that lack the deepest REQUIRED lag (excess signal excluded
+    # so its NaNs do not prune flow rows).
+    deepest = [f"{col}_lag{n_lags}" for col in required_lag]
     merged = merged.dropna(subset=deepest).reset_index(drop=True)
 
-    # Structurally drop contemporaneous macro/return predictors (keep regime
-    # label as metadata if present) to prevent look-ahead leakage (§3.2).
-    drop_contemporaneous = [c for c in macro_sources if c != _REGIME]
+    # Structurally drop contemporaneous macro/return + excess predictors (keep
+    # regime label as metadata if present) to prevent look-ahead leakage (§3.2).
+    drop_contemporaneous = [c for c in macro_sources if c != _REGIME] + extra
     merged = merged.drop(columns=drop_contemporaneous)
 
     return merged

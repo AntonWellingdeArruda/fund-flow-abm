@@ -3,7 +3,13 @@ import pandas as pd
 import pytest
 
 from fund_flow.data.dataset import build_dataset
-from fund_flow.predictor.backtest import compare, walk_forward
+from fund_flow.predictor.backtest import (
+    BacktestResult,
+    compare,
+    per_category_rmse,
+    per_category_table,
+    walk_forward,
+)
 from fund_flow.predictor.baselines import AR1Predictor, RandomWalkPredictor
 from fund_flow.predictor.reshape import wide_exog, wide_flows
 from fund_flow.predictor.var_model import VARXPredictor
@@ -137,3 +143,216 @@ class TestAcceptanceGate:
         ]
         tbl = compare(results)
         assert tbl["rmse"].is_monotonic_increasing
+
+
+class TestVARXExtensions:
+    def test_coefficients_labeled(self, matrices):
+        flows, exog = matrices
+        m = VARXPredictor(order=1, ridge_alpha=1.0).fit(flows.iloc[:60], exog.iloc[:60])
+        c = m.coefficients()
+        assert list(c.columns) == list(flows.columns)            # per-category
+        assert c.shape[0] == flows.shape[1] + exog.shape[1]      # flow lags + exog
+        assert any(name.endswith("_flow_lag1") for name in c.index)
+        assert set(exog.columns).issubset(set(c.index))
+
+    def test_predict_from_design_matches_predict_next(self, matrices):
+        flows, exog = matrices
+        m = VARXPredictor(order=1, ridge_alpha=1.0).fit(flows.iloc[:60], exog.iloc[:60])
+        X, _ = m._build_design(flows.iloc[:61].to_numpy(float),
+                               exog.iloc[:61].to_numpy(float))
+        from_design = m._predict_from_design(X[-1:])[0]
+        nxt = m.predict_next(exog.iloc[60]).to_numpy()
+        assert np.allclose(from_design, nxt)
+
+    def test_varxcv_selects_alpha_and_predicts(self, matrices):
+        from fund_flow.predictor.var_model import VARXCVPredictor
+        flows, exog = matrices
+        m = VARXCVPredictor(order=1, alphas=[0.1, 1.0, 10.0], val_months=12).fit(
+            flows.iloc[:80], exog.iloc[:80])
+        assert m.chosen_alpha_ in (0.1, 1.0, 10.0)
+        pred = m.predict_next(exog.iloc[80])
+        assert not pred.isnull().any()
+        assert list(pred.index) == list(flows.columns)
+
+    def test_varxcv_defaults_alpha_on_tiny_sample(self, matrices):
+        from fund_flow.predictor.var_model import VARXCVPredictor
+        flows, exog = matrices
+        m = VARXCVPredictor(order=1, val_months=24).fit(
+            flows.iloc[:6], exog.iloc[:6])          # no room for inner-train
+        assert m.chosen_alpha_ == 1.0
+
+
+class TestPerCategory:
+    def _result(self, errors):
+        return BacktestResult("m", rmse=0.0, mae=0.0,
+                              n_forecasts=errors.size, errors=errors)
+
+    def test_per_category_rmse(self):
+        errors = pd.DataFrame(
+            {"Crédito Privado": [3.0, -4.0], "Renda Fixa": [0.0, 0.0]},
+            index=["2024-01", "2024-02"],
+        )
+        r = per_category_rmse(self._result(errors))
+        assert r["Crédito Privado"] == pytest.approx((12.5) ** 0.5)  # sqrt(mean[9,16])
+        assert r["Renda Fixa"] == pytest.approx(0.0)
+        assert r.name == "m"
+
+    def test_per_category_table_one_col_per_model(self):
+        errors = pd.DataFrame({"A": [1.0, -1.0], "B": [2.0, 0.0]})
+        a = BacktestResult("ar1", 0, 0, 4, errors)
+        b = BacktestResult("varx", 0, 0, 4, errors)
+        tbl = per_category_table([a, b])
+        assert list(tbl.columns) == ["ar1", "varx"]
+        assert list(tbl.index) == ["A", "B"]
+
+
+class TestPerCategorySelect:
+    def test_selects_per_category_and_predicts(self, matrices):
+        from fund_flow.predictor.var_model import PerCategorySelectPredictor
+
+        flows, exog = matrices
+        m = PerCategorySelectPredictor(order=1, val_months=12).fit(
+            flows.iloc[:80], exog.iloc[:80]
+        )
+        # Each category gets a selection
+        assert set(m.selected_.keys()) == set(flows.columns)
+        assert all(v in ("ar1", "varxcv") for v in m.selected_.values())
+        # Prediction has correct shape and no NaN
+        pred = m.predict_next(exog.iloc[80])
+        assert list(pred.index) == list(flows.columns)
+        assert not pred.isnull().any()
+
+    def test_fallback_on_tiny_sample(self, matrices):
+        from fund_flow.predictor.var_model import PerCategorySelectPredictor
+
+        flows, exog = matrices
+        # Tiny sample — no room for inner split → default all to varxcv
+        m = PerCategorySelectPredictor(order=1, val_months=24).fit(
+            flows.iloc[:6], exog.iloc[:6]
+        )
+        assert all(v == "varxcv" for v in m.selected_.values())
+
+    def test_walk_forward_integration(self, matrices):
+        from fund_flow.predictor.var_model import PerCategorySelectPredictor
+
+        flows, exog = matrices
+        res = walk_forward(
+            lambda: PerCategorySelectPredictor(order=1),
+            flows, exog, min_train=36, name="per_cat",
+        )
+        assert res.rmse > 0
+        assert res.n_forecasts == (len(flows) - 36) * flows.shape[1]
+
+    def test_selects_excess_candidate_when_signal_drives_flow(self):
+        from fund_flow.predictor.var_model import PerCategorySelectPredictor
+
+        rng = np.random.default_rng(3)
+        n = 100
+        periods = pd.period_range("2010-01", periods=n, freq="M")
+        cats = ["A", "B"]
+        sigA = rng.normal(0, 1, n)
+        flows = pd.DataFrame(
+            {"A": 3.0 * sigA + rng.normal(0, 0.05, n), "B": rng.normal(0, 1, n)},
+            index=periods)
+        signals = {1: pd.DataFrame(np.c_[sigA, rng.normal(0, 1, n)],
+                                   index=periods, columns=cats)}
+        m = PerCategorySelectPredictor(order=1, signals=signals).fit(flows, None)
+        assert m.selected_["A"] == "excess"   # the predictive signal is picked
+        pred = m.predict_next(None)
+        assert not pred.isnull().any()
+
+
+class TestVARXExcessCV:
+    def _signals_frames(self, periods, cats, arr_by_w):
+        return {w: pd.DataFrame(a, index=periods, columns=cats)
+                for w, a in arr_by_w.items()}
+
+    def test_no_signals_all_windows_none(self, matrices):
+        from fund_flow.predictor.var_model import VARXExcessCVPredictor
+        flows, exog = matrices
+        m = VARXExcessCVPredictor(order=1, signals={}).fit(flows.iloc[:80], exog.iloc[:80])
+        assert set(m.windows_.values()) == {None}
+        pred = m.predict_next(exog.iloc[80])
+        assert list(pred.index) == list(flows.columns)
+        assert not pred.isnull().any()
+
+    def test_selects_window_when_signal_drives_flow(self):
+        from fund_flow.predictor.var_model import VARXExcessCVPredictor
+        rng = np.random.default_rng(0)
+        n = 90
+        periods = pd.period_range("2010-01", periods=n, freq="M")
+        cats = ["A", "B"]
+        # signal_A drives A's flow; B is pure noise. Signal is already lag-1 aligned
+        # (signal at period t == info usable to predict flow[t]).
+        sigA = rng.normal(0, 1, n)
+        sigB = rng.normal(0, 1, n)
+        flowA = 3.0 * sigA + rng.normal(0, 0.05, n)   # A depends ONLY on its signal
+        flowB = rng.normal(0, 1, n)
+        flows = pd.DataFrame({"A": flowA, "B": flowB}, index=periods)
+        signals = self._signals_frames(periods, cats, {1: np.c_[sigA, sigB]})
+        m = VARXExcessCVPredictor(order=1, signals=signals,
+                                  alphas=[0.1, 1.0, 10.0], val_months=24).fit(flows, None)
+        assert m.windows_["A"] == 1            # the predictive signal is selected
+        pred = m.predict_next(None)
+        assert np.isfinite(pred["A"]) and np.isfinite(pred["B"])
+
+    def test_handles_nan_signal_rows(self):
+        from fund_flow.predictor.var_model import VARXExcessCVPredictor
+        rng = np.random.default_rng(1)
+        n = 80
+        periods = pd.period_range("2010-01", periods=n, freq="M")
+        cats = ["A", "B"]
+        sig = rng.normal(0, 1, (n, 2))
+        sig[:20, 0] = np.nan          # A's signal absent early (e.g. pre-ETF benchmark)
+        flows = pd.DataFrame(rng.normal(0, 1, (n, 2)), index=periods, columns=cats)
+        signals = self._signals_frames(periods, cats, {3: sig})
+        m = VARXExcessCVPredictor(order=1, signals=signals, val_months=20).fit(flows, None)
+        pred = m.predict_next(None)
+        assert not pred.isnull().any()
+
+    def test_walk_forward_with_signals(self, matrices):
+        from fund_flow.predictor.var_model import VARXExcessCVPredictor
+        flows, exog = matrices
+        cats = list(flows.columns)
+        rng = np.random.default_rng(2)
+        sig = pd.DataFrame(rng.normal(0, 1, (len(flows), len(cats))),
+                           index=flows.index, columns=cats)
+        res = walk_forward(
+            lambda: VARXExcessCVPredictor(order=1, signals={1: sig}),
+            flows, exog, min_train=36, name="excess")
+        assert res.rmse > 0
+        assert res.n_forecasts == (len(flows) - 36) * flows.shape[1]
+
+
+class TestWalkForwardWindow:
+    def test_rolling_window_limits_train_size(self, matrices, monkeypatch):
+        flows, _ = matrices
+        seen = []
+
+        class Spy(AR1Predictor):
+            def fit(self, f, e=None):
+                seen.append(len(f))
+                return super().fit(f, e)
+
+        walk_forward(lambda: Spy(), flows, None, min_train=24, window=24)
+        # Every training window is capped at the rolling size, never expanding.
+        assert max(seen) == 24
+        assert min(seen) >= 24
+
+    def test_expanding_window_grows(self, matrices):
+        flows, _ = matrices
+        seen = []
+
+        class Spy(AR1Predictor):
+            def fit(self, f, e=None):
+                seen.append(len(f))
+                return super().fit(f, e)
+
+        walk_forward(lambda: Spy(), flows, None, min_train=24)  # window=None
+        assert seen[0] == 24 and seen[-1] > seen[0]  # expands
+
+    def test_test_window_restricts_forecasts(self, matrices):
+        flows, _ = matrices
+        res = walk_forward(lambda: AR1Predictor(), flows, None, min_train=24,
+                           test_start=30, test_end=40)
+        assert len(res.errors) == 10  # forecasts only for t in [30, 40)

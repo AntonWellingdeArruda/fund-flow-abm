@@ -37,6 +37,7 @@ def yahoo_online():
         pytest.skip("yfinance/Yahoo unreachable")
 
 
+@pytest.mark.live
 class TestLive:
     def test_real_ibovespa_level(self, yahoo_online):
         s = fetch_yahoo_close(IBOVESPA, start="2024-01-01", end="2024-03-31")

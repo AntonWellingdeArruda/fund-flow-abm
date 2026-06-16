@@ -73,6 +73,7 @@ def online():
         pytest.skip("BCB SGS unreachable (offline)")
 
 
+@pytest.mark.live
 class TestLive:
     def test_real_selic_in_plausible_range(self, online):
         s = fetch_sgs(SELIC_TARGET, start="2024-01-01", end="2024-03-31", timeout=15)

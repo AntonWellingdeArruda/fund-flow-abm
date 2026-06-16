@@ -67,10 +67,15 @@ class MarkovRegimePredictor(Predictor):
             for i in range(self.k_regimes):
                 for j in range(self.k_regimes):
                     e += trans[i, j] * filt[j] * (mu[i] + ar * (last - mu[j]))
+            if not np.isfinite(e):
+                # EM can "converge" to NaN params without raising; treat that as
+                # a failure and fall through to the AR(1) fallback below.
+                raise ValueError("non-finite Markov forecast")
             return float(e)
         except Exception:
             c, phi, last = _ar1_fallback(y)
-            return c + phi * last
+            val = c + phi * last
+            return float(val) if np.isfinite(val) else float(np.mean(y))
 
     def fit(self, flows, exog=None):
         self._columns = list(flows.columns)

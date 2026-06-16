@@ -31,10 +31,20 @@ class TestNormalizeCnpj:
 class TestParseInforme:
     def test_decimal_comma_and_columns(self):
         df = _parse_informe_csv(INFORME_CSV)
-        assert list(df.columns) == ["cnpj", "date", "captacao", "resgate", "pl"]
+        assert list(df.columns) == ["cnpj", "date", "captacao", "resgate", "pl", "quota"]
         assert df["captacao"].iloc[0] == pytest.approx(100.0)
         assert df["resgate"].iloc[0] == pytest.approx(30.5)
+        assert df["quota"].iloc[0] == pytest.approx(1.23)
         assert df["cnpj"].iloc[0] == "00000000000100"
+
+    def test_quota_nan_when_column_absent(self):
+        # VL_QUOTA missing entirely → quota column present but all-NaN, flows intact
+        text = ("CNPJ_FUNDO;DT_COMPTC;VL_PATRIM_LIQ;CAPTC_DIA;RESG_DIA\n"
+                "00.000.000/0001-00;2024-04-01;900,25;100,0;30,5\n")
+        df = _parse_informe_csv(text)
+        assert "quota" in df.columns
+        assert df["quota"].isna().all()
+        assert df["captacao"].iloc[0] == pytest.approx(100.0)
 
     def test_old_schema_cnpj_alias(self):
         df = _parse_informe_csv(INFORME_CSV_OLD)

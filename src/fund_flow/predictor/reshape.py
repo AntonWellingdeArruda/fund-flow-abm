@@ -9,11 +9,17 @@ from __future__ import annotations
 
 import pandas as pd
 
-# Lag columns that are NOT exogenous macro regressors: own-flow AR lags and the
-# latent regime label (kept out of exog because regime is unobserved in production).
+# Lag columns that are NOT shared-exog macro regressors: own-flow AR lags, the
+# latent regime label, and the Phase-2.6 PER-CATEGORY excess-return signals.
+# The excess signals vary BY category within a period, so they cannot ride the
+# shared (drop_duplicates) exog matrix; they are excluded here and consumed
+# directly by VARXExcessCVPredictor via wide_category_signal().
+_EXCESS_LAGS = frozenset({
+    "excess_ret_1m_lag1", "excess_ret_3m_lag1", "excess_ret_6m_lag1",
+})
 _NON_EXOG_LAGS = frozenset({
     "net_flow_brl_lag1", "redemption_gross_brl_lag1", "regime_lag1",
-})
+}) | _EXCESS_LAGS
 
 
 def exog_columns(frame: pd.DataFrame) -> list[str]:
@@ -35,6 +41,23 @@ def wide_flows(frame: pd.DataFrame, value: str = "net_flow_brl") -> pd.DataFrame
     Index is a monthly PeriodIndex (sorted); columns are categories.
     """
     wide = frame.pivot(index="period", columns="category", values=value)
+    wide.index = pd.PeriodIndex(wide.index, freq="M")
+    wide = wide.sort_index()
+    wide.columns.name = None
+    return wide
+
+
+def wide_category_signal(frame: pd.DataFrame, column: str) -> pd.DataFrame | None:
+    """Pivot a PER-CATEGORY column to a (period × category) matrix, or None if absent.
+
+    Used for the Phase-2.6 excess-return signals (e.g. 'excess_ret_3m_lag1'), which
+    — unlike shared macro — carry a different value per category in the same month.
+    NaNs are preserved (a category/month with no excess signal stays NaN; the
+    consuming predictor decides how to handle it). Index aligns with wide_flows().
+    """
+    if column not in frame.columns:
+        return None
+    wide = frame.pivot(index="period", columns="category", values=column)
     wide.index = pd.PeriodIndex(wide.index, freq="M")
     wide = wide.sort_index()
     wide.columns.name = None

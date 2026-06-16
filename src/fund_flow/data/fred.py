@@ -23,6 +23,7 @@ FRED_URL = "https://api.stlouisfed.org/fred/series/observations"
 # Series used by the macro adapter.
 UST_10Y = "DGS10"          # 10-Year Treasury constant maturity, % (daily)
 FED_FUNDS = "FEDFUNDS"     # Effective federal funds rate, % (monthly)
+VIX = "VIXCLS"             # CBOE Volatility Index, level (daily, 1990+) — risk-off
 SP500 = "SP500"            # S&P 500 index level (daily, ~10y history)
 USD_BROAD = "DTWEXBGS"     # Nominal broad USD index (daily) — DXY-style proxy
 

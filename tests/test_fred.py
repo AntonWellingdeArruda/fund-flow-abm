@@ -43,6 +43,7 @@ def fred_online():
         pytest.skip("FRED unreachable (offline)")
 
 
+@pytest.mark.live
 class TestLive:
     def test_ust10y_plausible(self, fred_online):
         s = fetch_fred(UST_10Y, fred_online, start="2024-01-01", end="2024-03-31")

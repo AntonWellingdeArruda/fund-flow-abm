@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import io
 import re
+import time
 import urllib.error
 import urllib.request
 import zipfile
@@ -26,6 +27,13 @@ import pandas as pd
 INFORME_URL = (
     "https://dados.cvm.gov.br/dados/FI/DOC/INF_DIARIO/DADOS/inf_diario_fi_{ym}.zip"
 )
+# Older months live in yearly HIST archives (one zip/year, 12 monthly CSVs
+# inside, CNPJ_FUNDO + period-decimals). The monthly endpoint only keeps the
+# trailing ~5 years. LAST_HIST_YEAR is the last year served as a yearly archive.
+HIST_URL = (
+    "https://dados.cvm.gov.br/dados/FI/DOC/INF_DIARIO/DADOS/HIST/inf_diario_fi_{year}.zip"
+)
+LAST_HIST_YEAR = 2020
 CADASTRO_URL = "https://dados.cvm.gov.br/dados/FI/CAD/DADOS/cad_fi.csv"
 # RCVM 175 class-level registry. registro_classe.csv keys on CNPJ_Classe (which
 # matches the informe's CNPJ_FUNDO_CLASSE) and carries the full ANBIMA taxonomy
@@ -53,17 +61,35 @@ def normalize_cnpj(value: str) -> str:
     return re.sub(r"\D", "", str(value))
 
 
-def _http_get_bytes(url: str, timeout: float) -> bytes:
+def _http_get_bytes(url: str, timeout: float, retries: int = 3) -> bytes:
+    """GET bytes from CVM, retrying transient failures.
+
+    The large HIST yearly archives intermittently time out mid-download (seen on
+    inf_diario_fi_2008.zip); a single failure should not silently drop a whole
+    year, so we back off (5s, 10s) and retry before giving up.
+    """
     req = urllib.request.Request(url, headers={"User-Agent": _UA})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.read()
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise CvmFetchError(f"CVM request failed: {url}\n{exc}") from exc
+    last: Exception | None = None
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read()
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            last = exc
+            if attempt < retries - 1:
+                time.sleep(5 * (attempt + 1))
+    raise CvmFetchError(f"CVM request failed after {retries} tries: {url}\n{last}") from last
 
 
 def _parse_informe_csv(text: str) -> pd.DataFrame:
-    """Parse one informe-diário CSV into [cnpj, date, captacao, resgate, pl]."""
+    """Parse one informe-diário CSV into [cnpj, date, captacao, resgate, pl, quota].
+
+    `quota` (VL_QUOTA, the daily share/quota value) is retained so Phase 2.6 can
+    compute fund-level monthly returns; the flows pipeline ignores it. VL_QUOTA is
+    present in both the RCVM-175 and the older schema (see test fixtures), but some
+    rows lack it, so it is parsed leniently (NaN when absent) and rows are still
+    only dropped for missing flow values.
+    """
     # All columns as str to preserve CNPJ leading zeros; numerics use decimal
     # comma, so convert ',' → '.' before to_numeric.
     df = pd.read_csv(io.StringIO(text), sep=";", dtype=str)
@@ -74,9 +100,10 @@ def _parse_informe_csv(text: str) -> pd.DataFrame:
     out = pd.DataFrame({"cnpj": df[cnpj_col].map(normalize_cnpj)})
     out["date"] = df["DT_COMPTC"]
     for src, dst in (("CAPTC_DIA", "captacao"), ("RESG_DIA", "resgate"),
-                     ("VL_PATRIM_LIQ", "pl")):
+                     ("VL_PATRIM_LIQ", "pl"), ("VL_QUOTA", "quota")):
+        col = df[src] if src in df.columns else pd.Series([None] * len(df))
         out[dst] = pd.to_numeric(
-            df[src].str.replace(",", ".", regex=False), errors="coerce"
+            col.str.replace(",", ".", regex=False), errors="coerce"
         )
     return out.dropna(subset=["captacao", "resgate"])
 
@@ -101,6 +128,41 @@ def fetch_informe_diario(year_month: str, timeout: float = 60.0) -> pd.DataFrame
     return pd.concat(frames, ignore_index=True)
 
 
+def fetch_informe_year(year: int, timeout: float = 180.0) -> dict[str, pd.DataFrame]:
+    """Download one yearly HIST archive → {YYYYMM: DataFrame} for its 12 months.
+
+    Each member is a distinct month (inf_diario_fi_YYYYMM.csv), so unlike the
+    monthly zip (which may split one month across class members) we key by month
+    rather than concatenating. Same column schema → same `_parse_informe_csv`.
+    """
+    raw = _http_get_bytes(HIST_URL.format(year=year), timeout)
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(raw))
+    except zipfile.BadZipFile as exc:
+        raise CvmFetchError(f"CVM returned a non-zip payload for HIST {year}") from exc
+
+    out: dict[str, pd.DataFrame] = {}
+
+    def _add(ym: str, df: "pd.DataFrame") -> None:
+        out[ym] = pd.concat([out[ym], df], ignore_index=True) if ym in out else df
+
+    for name in zf.namelist():
+        if not name.lower().endswith(".csv"):
+            continue
+        df = _parse_informe_csv(zf.read(name).decode("latin-1"))
+        m = re.search(r"_(\d{6})\.csv$", name)
+        if m:                                   # 2005+: one CSV per month
+            _add(m.group(1), df)
+        else:                                   # 2000-2004: whole year in one CSV;
+            # split rows by month using DT_COMPTC (kept as 'date', 'YYYY-MM-DD').
+            ym_col = df["date"].str.replace("-", "", regex=False).str.slice(0, 6)
+            for ym, grp in df.groupby(ym_col):
+                _add(str(ym), grp.drop(columns=[]))
+    if not out:
+        raise CvmFetchError(f"no CSV members in HIST archive for {year}")
+    return out
+
+
 def _parse_cadastro_csv(text: str) -> pd.DataFrame:
     """Parse cad_fi.csv into [cnpj, classe]."""
     df = pd.read_csv(io.StringIO(text), sep=";", dtype=str, encoding=None)
@@ -121,7 +183,14 @@ def fetch_cadastro(timeout: float = 60.0) -> pd.DataFrame:
 
 
 def _parse_registro_classe_csv(text: str) -> pd.DataFrame:
-    """Parse registro_classe.csv into [cnpj, anbima, classificacao, situacao]."""
+    """Parse registro_classe.csv into [cnpj, anbima, classificacao, situacao,
+    indicador, nome].
+
+    `indicador` is Indicador_Desempenho — the fund's declared performance
+    benchmark (e.g. 'DI de um dia', 'Ibovespa', 'Índice de Mercado Andima todas
+    NTN-B'); ~62% are blank/'Não se aplica'/'OUTROS', so `nome' (Denominacao_Social,
+    100% populated) backs the Phase-2.6 benchmark mapper's name fallback.
+    """
     df = pd.read_csv(io.StringIO(text), sep=";", dtype=str)
     if "CNPJ_Classe" not in df.columns:
         raise CvmFetchError(
@@ -132,6 +201,8 @@ def _parse_registro_classe_csv(text: str) -> pd.DataFrame:
         "anbima": df.get("Classificacao_Anbima"),
         "classificacao": df.get("Classificacao"),
         "situacao": df.get("Situacao"),
+        "indicador": df.get("Indicador_Desempenho"),
+        "nome": df.get("Denominacao_Social"),
     })
 
 

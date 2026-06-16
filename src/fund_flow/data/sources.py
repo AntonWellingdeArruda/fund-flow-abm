@@ -152,39 +152,65 @@ class CvmFlowSource:
         self.scale = scale
         self.timeout = timeout
 
+    def _aggregate_month(self, informe, cnpj_to_cat, period_str: str) -> list[dict]:
+        informe = informe.copy()
+        informe["category"] = informe["cnpj"].map(cnpj_to_cat)
+        informe = informe.dropna(subset=["category"])
+        grp = informe.groupby("category").agg(
+            captacao=("captacao", "sum"),
+            resgate=("resgate", "sum"),
+        )
+        return [
+            {
+                "period": period_str,
+                "category": category,
+                "net_flow_brl": (r["captacao"] - r["resgate"]) / self.scale,
+                "redemption_gross_brl": r["resgate"] / self.scale,
+            }
+            for category, r in grp.iterrows()
+        ]
+
     def load(self) -> pd.DataFrame:
-        from fund_flow.data.cvm import fetch_informe_diario
+        from fund_flow.data.cvm import (
+            LAST_HIST_YEAR,
+            fetch_informe_diario,
+            fetch_informe_year,
+        )
 
         cnpj_to_cat = self.mapper.mapping()
         months = pd.period_range(self.start, self.end, freq="M")
         rows = []
+        # Older months come from one yearly HIST archive each; fetch it once per
+        # year and reuse across its months rather than re-downloading per month.
+        hist_cache: dict[int, dict[str, "pd.DataFrame"]] = {}
         for m in months:
             ym = f"{m.year}{m.month:02d}"
-            informe = fetch_informe_diario(ym, self.timeout)
-            informe = informe.copy()
-            informe["category"] = informe["cnpj"].map(cnpj_to_cat)
-            informe = informe.dropna(subset=["category"])
-            grp = informe.groupby("category").agg(
-                captacao=("captacao", "sum"),
-                resgate=("resgate", "sum"),
-            )
-            for category, r in grp.iterrows():
-                rows.append({
-                    "period": str(m),
-                    "category": category,
-                    "net_flow_brl": (r["captacao"] - r["resgate"]) / self.scale,
-                    "redemption_gross_brl": r["resgate"] / self.scale,
-                })
+            if m.year <= LAST_HIST_YEAR:
+                if m.year not in hist_cache:
+                    hist_cache = {m.year: fetch_informe_year(m.year, self.timeout)}
+                informe = hist_cache[m.year].get(ym)
+                if informe is None:
+                    continue
+            else:
+                informe = fetch_informe_diario(ym, self.timeout)
+            rows.extend(self._aggregate_month(informe, cnpj_to_cat, str(m)))
         return pd.DataFrame(rows, columns=FLOW_COLUMNS)
 
 
 class FredMacroSource:
     """Real US macro from FRED (needs a free API key in FRED_API_KEY).
 
-    Returns: period, ust_10y, fed_funds, sp500_return, usd_broad_return.
+    Returns: period, fed_funds, ust_10y, vix — all with deep history
+    (FEDFUNDS 1954, DGS10 1962, VIXCLS 1990), so they cover the full flow window.
+    VIX is the CBOE volatility index (risk-off proxy), kept as a level.
+
+    FRED's S&P 500 (SP500) is licensed with a rolling ~10-year window and the
+    broad-dollar index (DTWEXBGS) starts only in 2006; including either here
+    would truncate an inner-joined macro panel to ~2016. Source the S&P 500 and
+    dollar index from YahooMacroSource instead (^GSPC / DX-Y.NYB, both 1985+).
     """
 
-    def __init__(self, start: str = "2010-01", end: str | None = None,
+    def __init__(self, start: str = "2004-01", end: str | None = None,
                  api_key: str | None = None, timeout: float = 30.0):
         self.start = start
         self.end = end
@@ -194,13 +220,7 @@ class FredMacroSource:
     def load(self) -> pd.DataFrame:
         from fund_flow.config import get_secret
         from fund_flow.data.bcb import to_monthly_last
-        from fund_flow.data.fred import (
-            FED_FUNDS,
-            SP500,
-            UST_10Y,
-            USD_BROAD,
-            fetch_fred,
-        )
+        from fund_flow.data.fred import FED_FUNDS, UST_10Y, VIX, fetch_fred
 
         key = self.api_key or get_secret("FRED_API_KEY")
         start_iso = pd.Period(self.start, freq="M").start_time.date().isoformat()
@@ -212,16 +232,10 @@ class FredMacroSource:
         def fetch(sid):
             return to_monthly_last(fetch_fred(sid, key, start_iso, end_iso, self.timeout))
 
-        ust = fetch(UST_10Y) / 100.0          # % → fraction
-        ff = fetch(FED_FUNDS) / 100.0
-        sp = fetch(SP500)
-        usd = fetch(USD_BROAD)
-
         df = pd.DataFrame({
-            "ust_10y": ust,
-            "fed_funds": ff,
-            "sp500_return": sp.pct_change(),
-            "usd_broad_return": usd.pct_change(),
+            "fed_funds": fetch(FED_FUNDS) / 100.0,     # % → fraction
+            "ust_10y": fetch(UST_10Y) / 100.0,
+            "vix": fetch(VIX),                          # index level (risk-off)
         }).dropna()
         df.index = df.index.astype(str)
         return df.reset_index(names="period")
@@ -250,6 +264,50 @@ class IbovespaSource:
         )
         close = to_monthly_last(fetch_yahoo_close(IBOVESPA, start_iso, end_iso))
         df = pd.DataFrame({"ibovespa_return": close.pct_change()}).dropna()
+        df.index = df.index.astype(str)
+        return df.reset_index(names="period")
+
+
+class YahooMacroSource:
+    """Real market returns via yfinance — monthly % change of each ticker.
+
+    Defaults to the three indices with deep history that FRED can't serve over
+    the full flow window:
+        ibovespa_return  ^BVSP      (1993+)
+        sp500_return     ^GSPC      (1985+)
+        dxy_return       DX-Y.NYB   (1985+)  US dollar index
+
+    Pass a custom {column_name: ticker} map to fetch a different set. Isolated
+    behind the MacroSource seam — if Yahoo's unofficial endpoint breaks, drop
+    this source from the composite and the rest still works.
+    """
+
+    DEFAULT_TICKERS = {
+        "ibovespa_return": "^BVSP",
+        "sp500_return": "^GSPC",
+        "dxy_return": "DX-Y.NYB",
+    }
+
+    def __init__(self, tickers: dict[str, str] | None = None,
+                 start: str = "2004-01", end: str | None = None):
+        self.tickers = tickers or dict(self.DEFAULT_TICKERS)
+        self.start = start
+        self.end = end
+
+    def load(self) -> pd.DataFrame:
+        from fund_flow.data.bcb import to_monthly_last
+        from fund_flow.data.yahoo import fetch_yahoo_close
+
+        start_iso = pd.Period(self.start, freq="M").start_time.date().isoformat()
+        end_iso = (
+            pd.Period(self.end, freq="M").end_time.date().isoformat()
+            if self.end else None
+        )
+        cols = {}
+        for name, ticker in self.tickers.items():
+            close = to_monthly_last(fetch_yahoo_close(ticker, start_iso, end_iso))
+            cols[name] = close.pct_change()
+        df = pd.DataFrame(cols).dropna()
         df.index = df.index.astype(str)
         return df.reset_index(names="period")
 
@@ -285,8 +343,9 @@ class BcbMacroSource:
 
     This is a deliberate SUBSET of the synthetic schema — it omits
     ibovespa_return / ust_10y (need B3/FRED) and the latent `regime` label.
-    The pipeline is macro-column-agnostic, so this subset flows through
-    cleaning → features → predictor unchanged.
+    The credit-spread lever (EMBI+) is NOT here: it is not on SGS, so it comes
+    from IPEAdata via IpeaMacroSource. The pipeline is macro-column-agnostic,
+    so this subset flows through cleaning → features → predictor unchanged.
     """
 
     def __init__(self, start: str = "2010-01", end: str | None = None,
@@ -335,3 +394,48 @@ class BcbMacroSource:
 MACRO_COLUMNS_BCB = [
     "period", "selic_rate", "delta_selic", "ipca_monthly", "usdbrl_return",
 ]
+
+
+class IpeaMacroSource:
+    """EMBI+ Risco-Brasil sovereign credit spread from IPEAdata (free, no key).
+
+    EMBI+ Brazil (JP Morgan) is THE Brazilian systematic credit-risk premium —
+    the closest free, long-history proxy for the debenture-vs-government spread
+    that drives Crédito Privado / Renda Fixa flows. It is daily back to 1994 but
+    the free series is DISCONTINUED at 2024-07, so an inner-joined macro panel
+    truncates there. Use it for backtests / ABM calibration, not live forecasts
+    past mid-2024.
+
+    Emits:
+        period, embi_spread (bps → fraction, level), delta_embi (monthly change)
+    """
+
+    def __init__(self, start: str | None = None, end: str | None = None,
+                 timeout: float = 60.0):
+        self.start = start
+        self.end = end
+        self.timeout = timeout
+
+    def load(self) -> pd.DataFrame:
+        from fund_flow.data.bcb import to_monthly_last
+        from fund_flow.data.ipea import EMBI_BRAZIL, fetch_ipea_series
+
+        embi = to_monthly_last(
+            fetch_ipea_series(EMBI_BRAZIL, self.timeout)
+        ) / 10000.0                     # bps → fraction (300 bps = 0.03)
+
+        df = pd.DataFrame({
+            "embi_spread": embi,                # sovereign credit-risk level
+            "delta_embi": embi.diff(),          # monthly change = risk-off impulse
+        }).dropna()
+        df.index = df.index.astype(str)         # PeriodIndex → "YYYY-MM"
+        df = df.reset_index(names="period")
+        if self.start is not None:
+            df = df[df["period"] >= self.start]
+        if self.end is not None:
+            df = df[df["period"] <= self.end]
+        return df[MACRO_COLUMNS_IPEA].reset_index(drop=True)
+
+
+# Columns the IPEAdata credit-spread adapter provides.
+MACRO_COLUMNS_IPEA = ["period", "embi_spread", "delta_embi"]
